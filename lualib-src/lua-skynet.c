@@ -495,6 +495,13 @@ ltrace(lua_State *L) {
 	return 0;
 }
 
+static int
+l_os_exit(lua_State *L) {
+	int code = (int)luaL_optinteger(L, 1, 0);
+	exit(code);
+	return 0;
+}
+
 LUAMOD_API int
 luaopen_skynet_core(lua_State *L) {
 	luaL_checkversion(L);
@@ -522,6 +529,7 @@ luaopen_skynet_core(lua_State *L) {
 		{ "trash" , ltrash },
 		{ "now", lnow },
 		{ "hpc", lhpc },	// getHPCounter
+		{ "os_exit", l_os_exit },	// clean process exit
 		{ NULL, NULL },
 	};
 

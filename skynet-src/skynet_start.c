@@ -34,11 +34,19 @@ struct worker_parm {
 };
 
 static volatile int SIG = 0;
+static volatile int F_SHUTDOWN = 0;
 
 static void
 handle_hup(int signal) {
 	if (signal == SIGHUP) {
 		SIG = 1;
+	}
+}
+
+static void
+handle_shutdown_signal(int signal) {
+	if (signal == SIGINT || signal == SIGTERM) {
+		F_SHUTDOWN = 1;
 	}
 }
 
@@ -127,6 +135,30 @@ signal_hup() {
 	}
 }
 
+static void
+signal_shutdown() {
+	// send TEXT "shutdown" to .shutdown_srv, triggering graceful shutdown coordinator
+	uint32_t handle = skynet_handle_findname(".shutdown_srv");
+	if (handle == 0) {
+		// fallback: try "shutdown_srv" without dot (some skynet versions strip dot)
+		handle = skynet_handle_findname("shutdown_srv");
+	}
+	if (handle) {
+		struct skynet_message smsg;
+		smsg.source = 0;
+		smsg.session = 0;
+		// "shutdown" as TEXT message data, sz includes type bits
+		smsg.data = skynet_malloc(9); // "shutdown\0"
+		memcpy(smsg.data, "shutdown", 9);
+		smsg.sz = 9 | ((size_t)PTYPE_TEXT << MESSAGE_TYPE_SHIFT);
+		skynet_context_push(handle, &smsg);
+	} else {
+		// no shutdown_srv registered, just log to stderr
+		fprintf(stderr, "SIGTERM/SIGINT received but no .shutdown_srv found, exiting\n");
+		exit(0);
+	}
+}
+
 static void *
 thread_timer(void *p) {
 	struct monitor * m = p;
@@ -141,6 +173,10 @@ thread_timer(void *p) {
 		if (SIG) {
 			signal_hup();
 			SIG = 0;
+		}
+		if (F_SHUTDOWN) {
+			signal_shutdown();
+			F_SHUTDOWN = 0;
 		}
 	}
 	// wakeup socket thread
@@ -270,6 +306,14 @@ skynet_start(struct skynet_config * config) {
 	sa.sa_flags = SA_RESTART;
 	sigfillset(&sa.sa_mask);
 	sigaction(SIGHUP, &sa, NULL);
+
+	// register SIGINT/SIGTERM for graceful shutdown (send "shutdown" to coordinator)
+	struct sigaction sa_shutdown;
+	sa_shutdown.sa_handler = &handle_shutdown_signal;
+	sa_shutdown.sa_flags = SA_RESTART;
+	sigfillset(&sa_shutdown.sa_mask);
+	sigaction(SIGINT, &sa_shutdown, NULL);
+	sigaction(SIGTERM, &sa_shutdown, NULL);
 
 	if (config->daemon) {
 		if (daemon_init(config->daemon)) {
