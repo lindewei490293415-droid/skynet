@@ -29,6 +29,18 @@
 - 编译：`make linux` → `luaclib/pb.so`（Makefile 独立 rule）
 - 配套纯 Lua 解析器 `protoc.lua`（开发期用）目前留在 simple-server 侧，本分支不重复携带
 
+### inotify（Linux inotify Lua 绑定，自研单模块）
+
+- 源码：`lualib-src/lua-inotify.c`（自写极简绑定，非拷贝第三方 .so——规避 ABI 漂移与构建链外二进制）
+- 用途：进程内热更 watcher（simple-server `hotupdate_watcher.lua`）的文件系统变更感知
+- API：`inotify.init{blocking=bool}` / `h:watchtree(path, mask)`（C 层 opendir 递归 addwatch，返回 `{ [wd]=path }`） / `h:addwatch/rmwatch/read/close`；常量挂模块表
+- 设计点：
+  - 事件用 `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`（文件写完/移入才报）——规避 scp 分批写的半读（对比 c2trunk 用 `IN_MODIFY` 需 hash 兜底）
+  - `watchtree` 下沉目录遍历（进程内 Lua 无 lfs）；`IN_ISDIR|IN_CREATE` 新目录由 Lua 侧补 watchtree
+  - 事件经内核 fd 队列积压，Lua 侧 timer tick 周期 `read()`（无 skynet 普通 fd 事件循环接入）
+  - 事件名含对齐 `\0` 填充，read 内截断到首个 `\0`（实测踩坑）
+- 编译：`make linux` → `luaclib/inotify.so`（Makefile `LUA_CLIB` 登记 + 独立 rule）
+
 ### 新增扩展的约定
 
 1. 源码放 `3rd/` 下（第三方）或 `lualib-src/`（自研单模块，参照 `bson`/`sproto` 先例）

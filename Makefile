@@ -53,7 +53,7 @@ update3rd :
 CSERVICE = snlua logger gate harbor
 LUA_CLIB = skynet \
   client \
-  bson md5 sproto lpeg cjson2 pb $(TLS_MODULE)
+  bson md5 sproto lpeg cjson2 pb inotify $(TLS_MODULE)
 
 LUA_CLIB_SKYNET = \
   lua-skynet.c lua-seri.c \
@@ -117,6 +117,10 @@ $(LUA_CLIB_PATH)/ltls.so : lualib-src/ltls.c | $(LUA_CLIB_PATH)
 
 $(LUA_CLIB_PATH)/lpeg.so : 3rd/lpeg/lpcap.c 3rd/lpeg/lpcode.c 3rd/lpeg/lpprint.c 3rd/lpeg/lptree.c 3rd/lpeg/lpvm.c 3rd/lpeg/lpcset.c | $(LUA_CLIB_PATH)
 	$(CC) $(CFLAGS) $(SHARED) -I3rd/lpeg $^ -o $@
+
+# simple-engine: lua-inotify（自写极简绑定，进程内 file_watcher 变更感知，见 docs/simple-engine.md）
+$(LUA_CLIB_PATH)/inotify.so : lualib-src/lua-inotify.c | $(LUA_CLIB_PATH)
+	$(CC) $(CFLAGS) $(SHARED) $^ -o $@
 
 # simple-engine: 随引擎发布的第三方 luaclib（详见 docs/simple-engine.md）
 $(LUA_CLIB_PATH)/cjson2.so : 3rd/luaclib/lcjson2/lua_cjson.c 3rd/luaclib/lcjson2/strbuf.c 3rd/luaclib/lcjson2/fpconv.c | $(LUA_CLIB_PATH)
