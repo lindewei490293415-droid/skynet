@@ -610,6 +610,10 @@ end
 
 skynet.now = c.now
 skynet.hpc = c.hpc	-- high performance counter
+-- simple-engine 定制：os_exit 在 C 模块 skynet.core（lua-skynet.c），这里暴露到 skynet 表，
+-- 供 graceful-shutdown P-B / 一次性服务干净退出整个进程（2026-09-03：此前漏转发导致
+-- skynet.os_exit 为 nil，pcall 静默失败、进程只能靠 pkill 兜底）
+skynet.os_exit = c.os_exit
 
 local traceid = 0
 function skynet.trace(info)
