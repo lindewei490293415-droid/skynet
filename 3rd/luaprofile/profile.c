@@ -1,448 +1,611 @@
 /*
- * profile.c -- simple-engine CPU call-tree sampler (DX P4.1).
- *
- * Why this exists: the plan (docs/plans/debug-system.md) called for vendoring
- * c2trunk's `3rd/luaprofile` (upstream lsg2020/skynet@4ace42e8). That source is
- * NOT obtainable in this environment (c2trunk engine submodule is not
- * initialised locally; upstream commit 4ace42e8 has no such directory), so this
- * is a from-scratch implementation with a compatible shape:
- *
- *   profile.start()            -> true | false, errmsg
- *   profile.stop()             -> time_us, nodes, info
- *   profile.dump()             -> time_us, nodes, info   (snapshot, keeps running)
- *   profile.mark()             -> true                   (coroutine creation point)
- *   profile.rescan()           -> n                      (re-install hooks on all threads)
- *
- * `nodes` is a call tree (path sensitive): every entry is
- *   { name, source, linedefined, count, value, self,
- *     alloc_count, alloc_bytes, children = { ... } }
- * `value` is inclusive microseconds, `self` is value minus children's value.
- *
- * Design notes (all four mechanisms were proven by the P4.0 probe first):
- *   - hooks are installed by walking global_State->allgc (Lua internal headers);
- *   - the allocator is hijacked with the ORIGINAL ud passed straight through
- *     (the engine casts that ud to struct snlua, so it must not be replaced);
- *   - unlike c2trunk's version we keep the sampler context in a static struct
- *     instead of inside `struct snlua`. That removes the ABI contract (no
- *     service_snlua.c patch, no snlua_profile_slot export) at the cost of
- *     "one sampling session per process", which is exactly how it is used.
- *   - timing uses clock_gettime(CLOCK_MONOTONIC); no rdtsc, so the build stays
- *     portable (slightly more overhead per hook, irrelevant in a 30s window).
- *
- * Build: see Makefile rule for $(LUA_CLIB_PATH)/profile.so (-I3rd/lua).
- * Requires the host to export the Lua API (-Wl,-E), same as every luaclib.
+ * simple-engine 补丁说明（相对 c2trunk / 上游 lsg2020/skynet@4ace42e8）：
+ * 1. 删除本地 `struct snlua` 定义与"把 allocf 的 ud 强转 snlua"的写法，改为经
+ *    引擎导出的 void ** snlua_profile_slot(void *ud) 存取 profile context。
+ *    这样"字段被上游移动/改名"的失败模式从"静默写坏内存"降级为"dlopen 显式
+ *    报未定义符号"（符号契约 vs 布局契约），详见 docs/simple-engine.md。
+ * 2. 其余保持上游原样；icallpath.c 必须一起编译（上游 makefile 漏了它）。
  */
-
-#include <string.h>
-#include <stdlib.h>
-#include <time.h>
-
-#include "lua.h"
-#include "lauxlib.h"
+#include "profile.h"
+#include "imap.h"
+#include "icallpath.h"
 #include "lobject.h"
 #include "lstate.h"
+#include <pthread.h>
 
-#define PF_MAX_NODE    16384
-#define PF_MAX_THREAD  128
-#define PF_MAX_DEPTH   512
-#define PF_HASH_BUCKET 32768
-#define PF_NAME_LEN    64
-#define PF_SRC_LEN     160
+/* defined by the engine: service-src/service_snlua.c */
+extern void ** snlua_profile_slot(void *l);
 
-typedef struct pf_node {
-	int parent;
-	int first_child;
-	int next_sibling;
-	char name[PF_NAME_LEN];
-	char source[PF_SRC_LEN];
-	int linedefined;
-	long long count;
-	long long value;        /* inclusive microseconds */
-	long long alloc_count;
-	long long alloc_bytes;
-} pf_node;
+// #include <google/profiler.h>
 
-typedef struct pf_frame {
-	int node;
-	long long enter_ns;
-} pf_frame;
+#define MAX_CALL_SIZE               1024
+#define NANOSEC                     1000000000
+#define MICROSEC                    1000000
 
-typedef struct pf_tstack {
-	lua_State *th;
-	int top;
-	pf_frame frames[PF_MAX_DEPTH];
-} pf_tstack;
+#ifdef USE_RDTSC
+    #include "rdtsc.h"
+    static inline uint64_t
+    gettime() {
+        return rdtsc();
+    }
 
-/* hash-bucket chain (separate from the tree's next_sibling list) */
-static int pf_hash_next[PF_MAX_NODE];
+    static inline double
+    realtime(uint64_t t) {
+        return (double) t / (2000000000);
+    }
+#else
+    static inline uint64_t
+    gettime() {
+        struct timespec ti;
+        // clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ti);
+        // clock_gettime(CLOCK_MONOTONIC, &ti);
+        clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
 
-static struct {
-	int running;
-	int node_n;
-	int hash[PF_HASH_BUCKET];
-	pf_node nodes[PF_MAX_NODE];
-	pf_tstack stacks[PF_MAX_THREAD];
-	int stack_n;
-	long long start_ns;
-	long long overflow;
-	int marked_node;
-	int cur_node;
-	lua_Alloc orig_alloc;
-	void *orig_ud;
-	lua_State *saved_th[PF_MAX_THREAD];
-	lua_Hook saved_hook[PF_MAX_THREAD];
-	int saved_mask[PF_MAX_THREAD];
-	int saved_count[PF_MAX_THREAD];
-	int saved_n;
-} pf;
+        long sec = ti.tv_sec & 0xffff;
+        long nsec = ti.tv_nsec;
 
-static long long pf_now_ns(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
-}
+        return sec * NANOSEC + nsec;
+    }
 
-static unsigned pf_hash(int parent, const char *src, int line) {
-	unsigned h = 2166136261u;
-	h ^= (unsigned)parent;
-	h *= 16777619u;
-	while (*src) {
-		h ^= (unsigned char)(*src++);
-		h *= 16777619u;
-	}
-	h ^= (unsigned)line;
-	h *= 16777619u;
-	return h & (PF_HASH_BUCKET - 1);
-}
+    static inline double
+    realtime(uint64_t t) {
+        return (double)t / NANOSEC;
+    }
+#endif
 
-static void pf_reset(void) {
-	int i;
-	pf.node_n = 1;                 /* node 0 is the synthetic root */
-	pf.stack_n = 0;
-	pf.overflow = 0;
-	pf.marked_node = -1;
-	pf.cur_node = 0;
-	pf.saved_n = 0;
-	pf.start_ns = pf_now_ns();
-	memset(pf.hash, 0xff, sizeof(pf.hash));
-	memset(&pf.nodes[0], 0, sizeof(pf_node));
-	pf.nodes[0].parent = -1;
-	pf.nodes[0].first_child = -1;
-	pf.nodes[0].next_sibling = -1;
-	strcpy(pf.nodes[0].name, "ROOT");
-	strcpy(pf.nodes[0].source, "");
-	pf.nodes[0].linedefined = -1;
-	for (i = 0; i < PF_MAX_THREAD; i++) {
-		pf.stacks[i].th = NULL;
-		pf.stacks[i].top = 0;
-	}
-}
 
-static int pf_node_find(int parent, const char *src, int line) {
-	unsigned h = pf_hash(parent, src, line);
-	int i = pf.hash[h];
-	while (i >= 0) {
-		if (pf.nodes[i].parent == parent && pf.nodes[i].linedefined == line &&
-			strcmp(pf.nodes[i].source, src) == 0) {
-			return i;
-		}
-		i = pf_hash_next[i];
-	}
-	return -1;
-}
-
-static int pf_node_get(int parent, const char *src, int line, const char *name) {
-	unsigned h;
-	int id;
-	if (parent < 0) {
-		parent = 0;
-	}
-	id = pf_node_find(parent, src, line);
-	if (id >= 0) {
-		return id;
-	}
-	if (pf.node_n >= PF_MAX_NODE) {
-		pf.overflow++;
-		return -1;
-	}
-	id = pf.node_n++;
-	memset(&pf.nodes[id], 0, sizeof(pf_node));
-	pf.nodes[id].parent = parent;
-	pf.nodes[id].first_child = -1;
-	pf.nodes[id].next_sibling = -1;
-	pf.nodes[id].linedefined = line;
-	strncpy(pf.nodes[id].source, src, PF_SRC_LEN - 1);
-	if (name != NULL) {
-		strncpy(pf.nodes[id].name, name, PF_NAME_LEN - 1);
-	} else {
-		strcpy(pf.nodes[id].name, "?");
-	}
-	h = pf_hash(parent, src, line);
-	pf_hash_next[id] = pf.hash[h];
-	pf.hash[h] = id;
-	/* link into the parent's child list */
-	pf.nodes[id].next_sibling = pf.nodes[parent].first_child;
-	pf.nodes[parent].first_child = id;
-	return id;
-}
-
-static pf_tstack *pf_stack_get(lua_State *L) {
-	int i;
-	for (i = 0; i < pf.stack_n; i++) {
-		if (pf.stacks[i].th == L) {
-			return &pf.stacks[i];
-		}
-	}
-	if (pf.stack_n >= PF_MAX_THREAD) {
-		pf.overflow++;
-		return NULL;
-	}
-	pf.stacks[pf.stack_n].th = L;
-	pf.stacks[pf.stack_n].top = 0;
-	pf.stack_n++;
-	return &pf.stacks[pf.stack_n - 1];
-}
-
-static void pf_hook(lua_State *L, lua_Debug *ar) {
-	pf_tstack *st;
-	if (!pf.running) {
-		return;
-	}
-	st = pf_stack_get(L);
-	if (st == NULL) {
-		return;
-	}
-	if (ar->event == LUA_HOOKCALL) {
-		int parent;
-		int id;
-		long long t;
-		if (st->top >= PF_MAX_DEPTH) {
-			pf.overflow++;
-			return;
-		}
-		lua_getinfo(L, "nSl", ar);
-		parent = (st->top > 0) ? st->frames[st->top - 1].node : pf.marked_node;
-		if (parent < 0) {
-			parent = 0;
-		}
-		id = pf_node_get(parent, ar->short_src ? ar->short_src : "?", ar->linedefined, ar->name);
-		t = pf_now_ns();
-		st->frames[st->top].node = id;
-		st->frames[st->top].enter_ns = t;
-		st->top++;
-		if (id >= 0) {
-			pf.nodes[id].count++;
-			pf.cur_node = id;
-		}
-	} else if (ar->event == LUA_HOOKRET) {
-		if (st->top > 0) {
-			long long t = pf_now_ns();
-			int id = st->frames[st->top - 1].node;
-			if (id >= 0) {
-				pf.nodes[id].value += (t - st->frames[st->top - 1].enter_ns) / 1000;
-			}
-			st->top--;
-			pf.cur_node = (st->top > 0) ? st->frames[st->top - 1].node : 0;
-		}
-	}
-}
-
-static void *pf_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
-	if (pf.running && pf.cur_node >= 0 && pf.cur_node < pf.node_n) {
-		pf.nodes[pf.cur_node].alloc_count++;
-		if (nsize > osize) {
-			pf.nodes[pf.cur_node].alloc_bytes += (long long)(nsize - osize);
-		}
-	}
-	return pf.orig_alloc(ud, ptr, osize, nsize);
-}
-
-/* install hooks on every thread of this state; returns how many were hooked */
-static int pf_install(lua_State *L) {
-	global_State *g = G(L);
-	GCObject *o;
-	int n = 0;
-	pf.saved_n = 0;
-	for (o = g->allgc; o != NULL; o = o->next) {
-		if (novariant(o->tt) == LUA_TTHREAD) {
-			lua_State *th = gco2th(o);
-			if (pf.saved_n < PF_MAX_THREAD) {
-				pf.saved_th[pf.saved_n] = th;
-				pf.saved_hook[pf.saved_n] = lua_gethook(th);
-				pf.saved_mask[pf.saved_n] = lua_gethookmask(th);
-				pf.saved_count[pf.saved_n] = lua_gethookcount(th);
-				pf.saved_n++;
-			}
-			lua_sethook(th, pf_hook, LUA_MASKCALL | LUA_MASKRET, 0);
-			n++;
-		}
-	}
-	if (pf.orig_alloc == NULL) {
-		void *ud = NULL;
-		pf.orig_alloc = lua_getallocf(L, &ud);
-		pf.orig_ud = ud;
-	}
-	lua_setallocf(L, pf_alloc, pf.orig_ud);
-	return n;
-}
-
-static void pf_uninstall(void) {
-	int i;
-	for (i = 0; i < pf.saved_n; i++) {
-		lua_sethook(pf.saved_th[i], pf.saved_hook[i], pf.saved_mask[i], pf.saved_count[i]);
-	}
-	pf.saved_n = 0;
-}
-
-static void pf_build_node(lua_State *L, int id) {
-	int child;
-	long long children_value = 0;
-	lua_newtable(L);
-	lua_pushstring(L, pf.nodes[id].name);
-	lua_setfield(L, -2, "name");
-	lua_pushstring(L, pf.nodes[id].source);
-	lua_setfield(L, -2, "source");
-	lua_pushinteger(L, pf.nodes[id].linedefined);
-	lua_setfield(L, -2, "linedefined");
-	lua_pushinteger(L, (lua_Integer)pf.nodes[id].count);
-	lua_setfield(L, -2, "count");
-	lua_pushinteger(L, (lua_Integer)pf.nodes[id].value);
-	lua_setfield(L, -2, "value");
-	lua_pushinteger(L, (lua_Integer)pf.nodes[id].alloc_count);
-	lua_setfield(L, -2, "alloc_count");
-	lua_pushinteger(L, (lua_Integer)pf.nodes[id].alloc_bytes);
-	lua_setfield(L, -2, "alloc_bytes");
-	lua_newtable(L);
-	{
-		int idx = 0;
-		for (child = pf.nodes[id].first_child; child >= 0; child = pf.nodes[child].next_sibling) {
-			children_value += pf.nodes[child].value;
-			pf_build_node(L, child);
-			lua_rawseti(L, -2, ++idx);
-		}
-	}
-	lua_setfield(L, -2, "children");
-	{
-		long long self = pf.nodes[id].value - children_value;
-		if (self < 0) {
-			self = 0;
-		}
-		lua_pushinteger(L, (lua_Integer)self);
-		lua_setfield(L, -2, "self");
-	}
-}
-
-static int pf_snapshot(lua_State *L) {
-	long long time_us = (pf_now_ns() - pf.start_ns) / 1000;
-	int i;
-	long long total_calls = 0;
-	long long total_alloc = 0;
-	long long total_bytes = 0;
-	for (i = 1; i < pf.node_n; i++) {
-		total_calls += pf.nodes[i].count;
-		total_alloc += pf.nodes[i].alloc_count;
-		total_bytes += pf.nodes[i].alloc_bytes;
-	}
-	lua_pushinteger(L, (lua_Integer)time_us);
-	/* nodes: children of the synthetic root */
-	lua_newtable(L);
-	{
-		int child;
-		int idx = 0;
-		for (child = pf.nodes[0].first_child; child >= 0; child = pf.nodes[child].next_sibling) {
-			pf_build_node(L, child);
-			lua_rawseti(L, -2, ++idx);
-		}
-	}
-	lua_newtable(L);
-	lua_pushinteger(L, (lua_Integer)(pf.node_n - 1));
-	lua_setfield(L, -2, "nodes");
-	lua_pushinteger(L, (lua_Integer)total_calls);
-	lua_setfield(L, -2, "calls");
-	lua_pushinteger(L, (lua_Integer)total_alloc);
-	lua_setfield(L, -2, "alloc_count");
-	lua_pushinteger(L, (lua_Integer)total_bytes);
-	lua_setfield(L, -2, "alloc_bytes");
-	lua_pushinteger(L, (lua_Integer)pf.overflow);
-	lua_setfield(L, -2, "overflow");
-	lua_pushboolean(L, pf.running);
-	lua_setfield(L, -2, "running");
-	return 3;
-}
-
-static int l_start(lua_State *L) {
-	if (pf.running) {
-		lua_pushboolean(L, 0);
-		lua_pushstring(L, "already running");
-		return 2;
-	}
-	pf_reset();
-	pf.running = 1;
-	pf_install(L);
-	lua_pushboolean(L, 1);
-	return 1;
-}
-
-static int l_stop(lua_State *L) {
-	if (!pf.running) {
-		lua_pushboolean(L, 0);
-		lua_pushstring(L, "not running");
-		return 2;
-	}
-	pf.running = 0;
-	pf_uninstall();
-	if (pf.orig_alloc != NULL) {
-		lua_setallocf(L, pf.orig_alloc, pf.orig_ud);
-	}
-	pf.cur_node = 0;
-	return pf_snapshot(L);
-}
-
-static int l_dump(lua_State *L) {
-	if (!pf.running) {
-		lua_pushboolean(L, 0);
-		lua_pushstring(L, "not running");
-		return 2;
-	}
-	return pf_snapshot(L);
-}
-
-static int l_mark(lua_State *L) {
-	pf_tstack *st = pf_stack_get(L);
-	pf.marked_node = (st != NULL && st->top > 0) ? st->frames[st->top - 1].node : 0;
-	lua_pushboolean(L, 1);
-	return 1;
-}
-
-static int l_rescan(lua_State *L) {
-	int n;
-	if (!pf.running) {
-		lua_pushboolean(L, 0);
-		lua_pushstring(L, "not running");
-		return 2;
-	}
-	pf_uninstall();
-	n = pf_install(L);
-	lua_pushinteger(L, n);
-	return 1;
-}
-
-static int l_running(lua_State *L) {
-	lua_pushboolean(L, pf.running);
-	return 1;
-}
-
-static const luaL_Reg pf_lib[] = {
-	{"start", l_start},
-	{"stop", l_stop},
-	{"dump", l_dump},
-	{"mark", l_mark},
-	{"rescan", l_rescan},
-	{"running", l_running},
-	{NULL, NULL}
+struct callpath_node;
+struct call_frame {
+    const void* point;
+    const void* prototype;
+    struct icallpath_context*   path;
+    bool  tail;
+    uint64_t call_time;
+    uint64_t ret_time;
+    uint64_t sub_cost;
+    uint64_t real_cost;
+    uint64_t alloc_co_cost;
+    uint64_t alloc_co_times;
+    uint64_t alloc_start;
+    uint64_t alloc_start_times;
 };
 
-int luaopen_profile(lua_State *L) {
-	luaL_newlib(L, pf_lib);
-	return 1;
+struct call_state {
+    lua_State*  co;
+    uint64_t    leave_time;
+    uint64_t    leave_alloc;
+    uint64_t    leave_alloc_times;
+    int         top;
+    struct call_frame   call_list[0];
+};
+
+struct profile_context {
+    uint64_t    start;
+    bool        increment_alloc_count;
+    uint64_t    alloc_count;
+    uint64_t alloc_times;
+    lua_Alloc   last_alloc_f;
+    void*       last_alloc_ud;
+    struct imap_context*        cs_map;
+    struct icallpath_context*   callpath;
+    struct call_state*          cur_cs;
+};
+
+struct callpath_node {
+    struct callpath_node*   parent;
+    const void* point;
+    const char* source;
+    const char* name;
+    int     line;
+    int     depth;
+    uint64_t ret_time;
+    uint64_t count;
+    uint64_t record_time;
+    uint64_t alloc_count;
+    uint64_t alloc_times;
+};
+
+static struct callpath_node*
+callpath_node_create() {
+    struct callpath_node* node = (struct callpath_node*)pmalloc(sizeof(*node));
+    node->parent = NULL;
+    node->point = NULL;
+    node->source = NULL;
+    node->name = NULL;
+    node->line = 0;
+    node->depth = 0;
+    node->ret_time = 0;
+    node->count = 0;
+    node->record_time = 0;
+    node->alloc_count = 0;
+    node->alloc_times = 0;
+    return node;
+}
+
+static struct profile_context *
+profile_create() {
+    struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
+
+    context->start = 0;
+    context->cs_map = imap_create();
+    context->callpath = NULL;
+    context->cur_cs = NULL;
+    context->increment_alloc_count = false;
+    context->alloc_count = 0;
+    context->alloc_times = 0;
+    context->last_alloc_f = NULL;
+    context->last_alloc_ud = NULL;
+    return context;
+}
+
+static void
+_ob_free_call_state(uint64_t key, void* value, void* ud) {
+    pfree(value);
+}
+static void
+profile_free(struct profile_context* context) {
+    if (context->callpath) {
+        icallpath_free(context->callpath);
+        context->callpath = NULL;
+    }
+
+    imap_dump(context->cs_map, _ob_free_call_state, NULL);
+    imap_free(context->cs_map);
+    pfree(context);
+}
+
+
+static inline struct call_frame *
+push_callframe(struct call_state* cs) {
+    if(cs->top >= MAX_CALL_SIZE) {
+        assert(false);
+    }
+    return &cs->call_list[cs->top++];
+}
+
+static inline struct call_frame *
+pop_callframe(struct call_state* cs) {
+    if(cs->top<=0) {
+        assert(false);
+    }
+    return &cs->call_list[--cs->top];
+}
+
+static inline struct call_frame *
+cur_callframe(struct call_state* cs) {
+    if(cs->top<=0) {
+        return NULL;
+    }
+
+    uint64_t idx = cs->top-1;
+    return &cs->call_list[idx];
+}
+
+/* NOTE: we deliberately do NOT declare struct snlua here (see the patch note at
+ * the top). The engine owns the layout and hands us the slot address. */
+static inline struct profile_context *
+_get_profile(lua_State* L) {
+    void *ud = NULL;
+    void **slot;
+    lua_getallocf(L, &ud);
+    if (ud == NULL) {
+        return NULL;
+    }
+    slot = snlua_profile_slot(ud);
+    if (slot == NULL) {
+        return NULL;
+    }
+    return (struct profile_context *)(*slot);
+}
+
+static struct icallpath_context*
+get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, struct icallpath_context* pre_callpath, struct call_frame* frame) {
+    if (!context->callpath) {
+        struct callpath_node* node = callpath_node_create();
+        node->name = "total";
+        node->source = node->name;
+        context->callpath = icallpath_create(0, node);
+    }
+    struct icallpath_context* path = pre_callpath;
+    if (!path) {
+        path = context->callpath;
+    }
+
+    struct call_frame* cur_cf = frame;
+    uint64_t k = (uint64_t)((uintptr_t)cur_cf->prototype);
+    struct icallpath_context* child_path = icallpath_get_child(path, k);
+    if (!child_path) {
+        struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(path);
+        struct callpath_node* node = callpath_node_create();
+
+        node->parent = path_parent;
+        node->point = cur_cf->prototype;
+        node->depth = path_parent->depth + 1;
+        node->ret_time = 0;
+        node->record_time = 0;
+        node->count = 0;
+        node->alloc_count = 0;
+        node->alloc_times = 0;
+        child_path = icallpath_add_child(path, k, node);
+    }
+    path = child_path;
+
+    struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(path);
+    if (cur_node->name == NULL) {
+        const char* name = NULL;
+        #ifdef USE_EXPORT_NAME
+            lua_getinfo(co, "nSl", far);
+            name = far->name;
+        #else
+            lua_getinfo(co, "Sl", far);
+        #endif
+        int line = far->linedefined;
+        const char* source = far->source;
+        char flag = far->what[0];
+        if (flag == 'C') {
+            lua_Debug ar2;
+            int i=0;
+            int ret = 0;
+            do {
+                i++;
+                ret = lua_getstack(co, i, &ar2);
+                flag = 'C';
+                if(ret) {
+                    lua_getinfo(co, "Sl", &ar2);
+                    if(ar2.what[0] != 'C') {
+                        line = ar2.currentline;
+                        source = ar2.source;
+                        break;
+                    }
+                }
+            }while(ret);
+        }
+
+        cur_node->name = name ? name : "null";
+        cur_node->source = source ? source : "null";
+        cur_node->line = line;
+    }
+
+    return path;
+}
+
+static void*
+_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    void **slot = (ud != NULL) ? snlua_profile_slot(ud) : NULL;
+    struct profile_context* context = (slot != NULL) ? (struct profile_context*)(*slot) : NULL;
+    size_t old = ptr == NULL ? 0 : osize;
+    if (context == NULL) {
+        return NULL;
+    }
+    if (nsize > 0 && nsize > old && context->increment_alloc_count) {
+        context->alloc_count += (nsize - old);
+        context->alloc_times++;
+    }
+
+    void* p = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    return p;
+}
+
+static void
+_resolve_hook(lua_State* L, lua_Debug* far) {
+    struct profile_context* context = _get_profile(L);
+    if(context == NULL || context->start == 0) {
+        return;
+    }
+
+    uint64_t cur_time = gettime();
+    context->increment_alloc_count = false;
+    int event = far->event;
+    struct call_state* cs = context->cur_cs;
+    if (!context->cur_cs || context->cur_cs->co != L) {
+        uint64_t key = (uint64_t)((uintptr_t)L);
+        cs = imap_query(context->cs_map, key);
+        if (cs == NULL) {
+            cs = (struct call_state*)pmalloc(sizeof(struct call_state) + sizeof(struct call_frame)*MAX_CALL_SIZE);
+            cs->co = L;
+            cs->top = 0;
+            cs->leave_time = 0;
+            cs->leave_alloc = 0;
+            cs->leave_alloc_times = 0;
+            imap_set(context->cs_map, key, cs);
+        }
+
+        if (context->cur_cs) {
+            context->cur_cs->leave_time = cur_time;
+            context->cur_cs->leave_alloc = context->alloc_count;
+            context->cur_cs->leave_alloc_times = context->alloc_times;
+        }
+        context->cur_cs = cs;
+    }
+    if (cs->leave_time > 0) {
+        assert(cur_time >= cs->leave_time);
+        uint64_t co_cost = cur_time - cs->leave_time;
+        uint64_t co_alloc = context->alloc_count - cs->leave_alloc;
+        uint64_t co_alloc_times = context->alloc_times - cs->leave_alloc_times;
+
+        int i = 0;
+        for (; i < cs->top; i++) {
+            cs->call_list[i].sub_cost += co_cost;
+            cs->call_list[i].alloc_co_cost += co_alloc;
+            cs->call_list[i].alloc_co_times += co_alloc_times;
+        }
+        cs->leave_time = 0;
+        cs->leave_alloc = 0;
+        cs->leave_alloc_times = 0;
+    }
+    assert(cs->co == L);
+
+    if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
+        const void* point = NULL;
+        if (far->i_ci && far->i_ci->func.p) {
+            point = far->i_ci->func.p;
+        } else {
+            lua_getinfo(L, "f", far);
+            point = lua_topointer(L, -1);
+        }
+
+        struct icallpath_context* pre_callpath = NULL;
+        struct call_frame* pre_frame = cur_callframe(cs);
+        if (pre_frame) {
+            pre_callpath = pre_frame->path;
+        }
+
+        struct call_frame* frame = push_callframe(cs);
+        frame->point = point;
+        frame->tail = event == LUA_HOOKTAILCALL;
+        frame->sub_cost = 0;
+        frame->call_time = cur_time;
+        frame->alloc_co_cost = 0;
+        frame->alloc_co_times = 0;
+        frame->alloc_start = context->alloc_count;
+        frame->alloc_start_times = context->alloc_times;
+        frame->prototype = point;
+        if (far->i_ci && far->i_ci->func.p) {
+            TValue* v =  s2v(far->i_ci->func.p);
+            switch (ttypetag(v))
+            {
+                case LUA_VCCL: frame->prototype = clCvalue(v)->f; break;
+                case LUA_VLCL: frame->prototype = clLvalue(v)->p; break;
+                case LUA_VLCF: frame->prototype =  fvalue(v); break;
+            default:
+                break;
+            }
+        }
+        frame->path = get_frame_path(context, L, far, pre_callpath, frame);
+    } else if (event == LUA_HOOKRET) {
+        int len = cs->top;
+        if (len <= 0) {
+            context->increment_alloc_count = true;
+            return;
+        }
+        bool tail_call = false;
+        do {
+            struct call_frame* cur_frame = pop_callframe(cs);
+            struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
+            uint64_t total_cost = cur_time - cur_frame->call_time;
+            uint64_t real_cost = total_cost - cur_frame->sub_cost;
+            uint64_t alloc_count = context->alloc_count - cur_frame->alloc_start - cur_frame->alloc_co_cost;
+            uint64_t alloc_times = context->alloc_times - cur_frame->alloc_start_times - cur_frame->alloc_co_times;
+            assert(context->alloc_count >= (cur_frame->alloc_start + cur_frame->alloc_co_cost));
+            assert(context->alloc_times >= (cur_frame->alloc_start_times + cur_frame->alloc_co_times));
+            assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->sub_cost);
+            cur_frame->ret_time = cur_time;
+            cur_frame->real_cost = real_cost;
+
+            cur_path->ret_time = cur_path->ret_time == 0 ? cur_time : cur_path->ret_time;
+            cur_path->record_time += real_cost;
+            cur_path->count++;
+            cur_path->alloc_count += alloc_count;
+            cur_path->alloc_times += alloc_times;
+
+            struct call_frame* pre_frame = cur_callframe(cs);
+            tail_call = pre_frame ? cur_frame->tail : false;
+        }while(tail_call);
+    }
+
+    context->increment_alloc_count = true;
+}
+
+
+struct dump_call_path_arg {
+    lua_State* L;
+    uint64_t record_time;
+    uint64_t count;
+    uint64_t index;
+    uint64_t alloc_count;
+    uint64_t alloc_times;
+};
+
+static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
+static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
+    struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
+    _dump_call_path((struct icallpath_context*)value, arg);
+    lua_seti(arg->L, -2, ++arg->index);
+}
+static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg) {
+    lua_checkstack(arg->L, 3);
+    lua_newtable(arg->L);
+
+    struct dump_call_path_arg child_arg;
+    child_arg.L = arg->L;
+    child_arg.record_time = 0;
+    child_arg.count = 0;
+    child_arg.index = 0;
+    child_arg.alloc_count = 0;
+    child_arg.alloc_times = 0;
+
+    if (icallpath_children_size(path) > 0) {
+        lua_newtable(arg->L);
+        icallpath_dump_children(path, _dump_call_path_child, &child_arg);
+        lua_setfield(arg->L, -2, "children");
+    }
+
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    uint64_t alloc_count = node->alloc_count > child_arg.alloc_count ? node->alloc_count : child_arg.alloc_count;
+    uint64_t alloc_times = node->alloc_times > child_arg.alloc_times ? node->alloc_times : child_arg.alloc_times;
+    uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
+    uint64_t rt = realtime(node->record_time) * MICROSEC;
+    uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
+
+    arg->record_time += record_time;
+    arg->count += count;
+    arg->alloc_count += alloc_count;
+    arg->alloc_times += alloc_times;
+
+    char name[512] = {0};
+    snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
+    lua_pushstring(arg->L, name);
+    lua_setfield(arg->L, -2, "name");
+
+    lua_pushinteger(arg->L, count);
+    lua_setfield(arg->L, -2, "count");
+
+    lua_pushinteger(arg->L, record_time);
+    lua_setfield(arg->L, -2, "value");
+
+    lua_pushinteger(arg->L, node->ret_time);
+    lua_setfield(arg->L, -2, "rettime");
+
+    lua_pushinteger(arg->L, alloc_count);
+    lua_setfield(arg->L, -2, "alloc_count");
+
+    lua_pushinteger(arg->L, alloc_times);
+    lua_setfield(arg->L, -2, "alloc_times");
+}
+static void dump_call_path(lua_State* L, struct icallpath_context* path) {
+    struct dump_call_path_arg arg;
+    arg.L = L;
+    arg.record_time = 0;
+    arg.count = 0;
+    arg.index = 0;
+    arg.alloc_count = 0;
+    arg.alloc_times = 0;
+    _dump_call_path(path, &arg);
+}
+
+
+static int
+hook_all_coroutines(lua_State* L, lua_Hook func, int mask, int count) {
+    int i = 0;
+    struct global_State* lG = L->l_G;
+    lua_sethook(mainthread(lG), _resolve_hook, mask, count);
+
+    struct GCObject* obj = lG->allgc;
+    while (obj) {
+        if (obj->tt == LUA_TTHREAD) {
+            lua_sethook(gco2th(obj), _resolve_hook, mask, count);
+        }
+        obj = obj->next;
+    }
+    return i;
+}
+
+static int
+_lstart(lua_State* L) {
+    struct profile_context* context = _get_profile(L);
+    void *ud = NULL;
+    void **slot = NULL;
+    lua_getallocf(L, (void**)&ud);
+    slot = (ud != NULL) ? snlua_profile_slot(ud) : NULL;
+    if (context || (slot != NULL && *slot != NULL)) {
+        return 0;
+    }
+    // ProfilerStart("my.prof");
+    // init registry
+    context = profile_create();
+
+    context->start = gettime();
+    context->last_alloc_f = lua_getallocf(L, (void**)&context->last_alloc_ud);
+    if (slot != NULL) {
+        *slot = context;   /* engine owns the storage; we only fill the slot */
+    }
+    lua_setallocf(L, _resolve_alloc, context->last_alloc_ud);
+    hook_all_coroutines(L, _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
+    context->increment_alloc_count = true;
+    return 0;
+}
+
+static int
+_lstop(lua_State* L) {
+    struct profile_context* context = _get_profile(L);
+    if (!context) {
+        return 0;
+    }
+    context->increment_alloc_count = false;
+    //ProfilerStop();
+
+    void* current_ud = NULL;
+    void **slot = NULL;
+    lua_getallocf(L, (void**)&current_ud);
+    slot = (current_ud != NULL) ? snlua_profile_slot(current_ud) : NULL;
+    if (slot != NULL) {
+        *slot = NULL;
+    }
+    lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
+
+    hook_all_coroutines(L, NULL, 0, 0);
+    profile_free(context);
+    return 0;
+}
+
+static int
+_lmark(lua_State* L) {
+    struct profile_context* context = _get_profile(L);
+    if (!context) {
+        return 0;
+    }
+    lua_State* co = lua_tothread(L, 1);
+    if(co == NULL) {
+        co = L;
+    }
+    if(context->start != 0) {
+        lua_sethook(co, _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
+    }
+    lua_pushboolean(L, context->start != 0);
+    return 1;
+}
+
+static int
+_lunmark(lua_State* L) {
+    struct profile_context* context = _get_profile(L);
+    if (!context) {
+        return 0;
+    }
+    lua_State* co = lua_tothread(L, 1);
+    if(co == NULL) {
+        co = L;
+    }
+    lua_sethook(co, NULL, 0, 0);
+    return 0;
+}
+
+static int
+_ldump(lua_State* L) {
+    struct profile_context* context = _get_profile(L);
+    struct snlua *ud = NULL;
+    lua_getallocf(L, (void**)&ud);
+    if (ud &&context && context->callpath) {
+        context->increment_alloc_count = false;
+        uint64_t record_time = realtime(gettime() - context->start) * MICROSEC;
+        lua_pushinteger(L, record_time);
+        dump_call_path(L, context->callpath);
+        context->increment_alloc_count = true;
+        return 2;
+    }
+    return 0;
+}
+
+int
+luaopen_profile_c(lua_State* L) {
+    luaL_checkversion(L);
+     luaL_Reg l[] = {
+        {"start", _lstart},
+        {"stop", _lstop},
+        {"mark", _lmark},
+        {"unmark", _lunmark},
+        {"dump", _ldump},
+        {NULL, NULL},
+    };
+    luaL_newlib(L, l);
+    return 1;
 }

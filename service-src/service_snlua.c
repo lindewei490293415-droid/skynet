@@ -24,6 +24,9 @@
 #define MEMORY_WARNING_REPORT (1024 * 1024 * 32)
 
 struct snlua {
+	/* 被 3rd/luaprofile 依赖：profile_context 必须保持首字段，勿调整字段顺序。
+	   该字段只经 snlua_profile_slot() 存取（符号契约），C 库不感知本结构布局。 */
+	void * profile_context;
 	lua_State * L;
 	struct skynet_context * ctx;
 	size_t mem;
@@ -59,6 +62,14 @@ codecache(lua_State *L) {
 }
 
 #endif
+
+/* 供 3rd/luaprofile 存取 profile context：返回槽位地址而非结构体布局，
+   使 C 库与 struct snlua 解耦（引擎升级移动字段时 dlopen 显式失败而非静默写坏内存）。
+   经 -Wl,-E 导出（platform.mk），与 sngo.so 取 skynet_context_push 同一机制。 */
+void **
+snlua_profile_slot(struct snlua *l) {
+	return &l->profile_context;
+}
 
 static void
 signal_hook(lua_State *L, lua_Debug *ar) {

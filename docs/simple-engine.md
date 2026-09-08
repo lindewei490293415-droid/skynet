@@ -41,16 +41,15 @@
   - 事件名含对齐 `\0` 填充，read 内截断到首个 `\0`（实测踩坑）
 - 编译：`make linux` → `luaclib/inotify.so`（Makefile `LUA_CLIB` 登记 + 独立 rule）
 
-### luaprofile（CPU 调用树采样器，自研）
+### luaprofile（CPU 调用树采样器，vendor c2trunk + 符号契约补丁）
 
-- 源码：`3rd/luaprofile/profile.c`（单文件）；背景、API 与边界见 `3rd/luaprofile/README.md`
+- 源码：`3rd/luaprofile/`（`profile.c` + `imap.c` + `icallpath.c` + 4 个头文件）；来源、补丁、API 与边界见 `3rd/luaprofile/README.md`
 - 用途：simple-server DX P4「CPU 采样分析」的底层采样器（主仓侧封装 `framework/debug/profiler.ts` + 控制台 `prof` / `profdump`）
-- **来源：自研，不是 vendor**。原计划 vendor c2trunk `3rd/luaprofile`（上游标注 `lsg2020/skynet@4ace42e8` + c2trunk 自加 `icallpath`）；2026-09-08 核实**该源码不可得**——本地 c2trunk 引擎 submodule 未初始化、上游该 commit 的 tree 中无此目录（只有 `lualib/compat10/profile.lua`）。改为自研，接口形态（`start/stop/mark/dump` + 调用树）与 c2trunk 对齐
-- 编译：`make linux` → `luaclib/profile.so`（Makefile `LUA_CLIB` 登记 + 独立 rule，`-I3rd/lua`）
-- **依赖 Lua 内部头**（`3rd/lua/lobject.h`、`lstate.h`）：遍历 `global_State->allgc` 给所有线程装 `LUA_MASKCALL|LUA_MASKRET` hook，并劫持 `lua_setallocf` 统计分配——**必须透传原 ud**（引擎 `lalloc` / `resumeX` / `signal_hook` 都把该 ud 当 `struct snlua` 用，换成别的指针会立刻崩）。Lua 5.5.1 内部头可用性由 simple-server 侧 P4.0 编译探针实测确认（探针不在本仓，见 simple-server `tools/profile_probe/`）
-- **不修改 `service-src/service_snlua.c`**：采样 context 存静态结构，不像 c2trunk 那样塞进 `struct snlua` 首字段（也就不需要导出 `snlua_profile_slot()`）。收益是**无 ABI 布局契约**、引擎升级不漂移；代价是进程内单采样会话（采样本就单会话 + 重入互斥）
-- 计时：`clock_gettime(CLOCK_MONOTONIC)`（不用 rdtsc，保持可移植；精度 ns，采样窗口开销可接受）
-- API：`start()/stop()/dump()/mark()/rescan()/running()`；节点按 `(parent, source, linedefined)` 聚合成**路径敏感**调用树，含 `count/value/self/alloc_count/alloc_bytes`
+- **来源：vendor c2trunk 引擎仓**（`D:\workspace\skynet-engine\skynet\3rd\luaprofile`，上游标注 `lsg2020/skynet@4ace42e8`）。历程：2026-09-08 曾因"本地找不到源码"先自研一版（`1bcc174`），同日用户指出旧引擎真实位置后**切回 vendor，自研版弃用**（代码在该 commit 历史，决策记录见 README §1）
+- 编译：`make linux` → `luaclib/profile.so`（Makefile `LUA_CLIB` 登记 + 独立 rule，`imap.c icallpath.c profile.c` 三文件一起编——上游 makefile 漏了 icallpath.c）
+- **依赖 Lua 内部头**（`3rd/lua/lobject.h`、`lstate.h`）：遍历 `global_State->allgc` 给所有线程装 `CALL|RET` hook，并劫持 `lua_setallocf` 统计分配——**必须透传原 ud**（引擎 `lalloc` / `resumeX` / `signal_hook` 都把该 ud 当 `struct snlua` 用）
+- **引擎侧改动（唯一一处，符号契约）**：`service-src/service_snlua.c` 的 `struct snlua` **首位**加 `void * profile_context;`（c2trunk 同款，勿调整字段顺序）+ 导出 `void ** snlua_profile_slot(struct snlua *l)`；C 库**删掉了本地 `struct snlua` 定义**、只经该函数存取——布局契约降级为符号契约，上游 bump 时失败模式为 dlopen 显式报错而非静默写坏内存。**注意 snlua.so 与 profile.so 必须同代**（旧 snlua.so 无该字段时，profile.so 会读到野指针）
+- API（对齐 c2trunk `require "profile.c"`）：`start/stop/mark/unmark/dump`；`dump` 返回 `(time_us, root_node)`，根节点 `total` 的 `children` 为路径敏感调用树（`name/count/value/rettime/alloc_count(字节)/alloc_times(次数)/children`）；**stop 不返回数据，须先 dump**；`count/alloc` 父节点取 max(children,self) 非求和
 
 ### 新增扩展的约定
 

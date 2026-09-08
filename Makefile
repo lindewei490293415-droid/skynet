@@ -129,12 +129,13 @@ $(LUA_CLIB_PATH)/cjson2.so : 3rd/luaclib/lcjson2/lua_cjson.c 3rd/luaclib/lcjson2
 $(LUA_CLIB_PATH)/pb.so : 3rd/lua-protobuf/pb.c | $(LUA_CLIB_PATH)
 	$(CC) $(CFLAGS) $(SHARED) $^ -o $@
 
-# simple-engine: luaprofile —— 自研 CPU 调用树采样器（DX P4.1）
-# 依赖 Lua 内部头（3rd/lua）：遍历 allgc 装全协程 hook + 劫持 allocf；
-# context 存静态结构而非 struct snlua，故无需改 service_snlua.c（无 ABI 契约）。
+# simple-engine: luaprofile —— CPU 调用树采样器（DX P4.1，vendor c2trunk + 符号契约补丁）
+# 依赖 Lua 内部头（3rd/lua）：遍历 allgc 装全协程 hook + 劫持 allocf（透传原 ud）。
+# 注意：icallpath.c 必须与 imap.c / profile.c 一起编（上游 makefile 漏了它）。
+# context 经引擎导出的 snlua_profile_slot() 存取（struct snlua 首字段）。
 # 详见 docs/simple-engine.md 与 3rd/luaprofile/README.md
-$(LUA_CLIB_PATH)/profile.so : 3rd/luaprofile/profile.c | $(LUA_CLIB_PATH)
-	$(CC) $(CFLAGS) $(SHARED) -I3rd/lua $^ -o $@
+$(LUA_CLIB_PATH)/profile.so : 3rd/luaprofile/imap.c 3rd/luaprofile/icallpath.c 3rd/luaprofile/profile.c | $(LUA_CLIB_PATH)
+	$(CC) $(CFLAGS) $(SHARED) -I3rd/lua -I3rd/luaprofile -DUSE_RDTSC -DUSE_EXPORT_NAME $^ -o $@ -lpthread
 
 clean :
 	rm -f $(SKYNET_BUILD_PATH)/skynet $(CSERVICE_PATH)/*.so $(LUA_CLIB_PATH)/*.so && \
