@@ -71,6 +71,19 @@ make linux
 - graceful-shutdown（simple-server `docs/plans/graceful-shutdown.md` 阶段 4，P-B 路径）：
   - `skynet_start.c`：SIGINT/SIGTERM → `handle_shutdown()` → 向协调服务推 `PTYPE_TEXT "shutdown"`
   - `lua-skynet.c`：新增 `skynet.os_exit(code)`（进程干净退出）
+- **跨线程 push 唤醒 worker（2026-09-16，perf-evaluation §十.6 T5）**：
+  - 问题：`skynet_mq_push` 只把队列挂进 global queue、**不唤醒任何 worker**；worker 睡在
+    `pthread_cond_wait(&m->cond)`，全仓只有 `thread_timer` 每 **2.5ms**（`usleep(2500)`）的
+    `wakeup(m, m->count-1)` 与 `thread_socket` 事件会 signal ⇒ **空闲服务收到外部 push 的消息要等
+    一个 tick**。实测代价：sngo 池调用闭合环每调用固定 +2.5ms（conc=1 时 p50 全钉在 2.57ms）。
+  - 改动（3 处，共 +43 行）：`skynet_server.h` 声明 `skynet_wakeup_worker()`；`skynet_start.c`
+    定义它（`start()` 登记 `G_MONITOR`；`m->sleep != 0` 时**持 `m->mutex`** 发 `cond_signal`——
+    持锁才能杜绝 lost-wakeup；sleep==0 直接返回，消息热路径零锁开销，丢一次信号也只会退化为
+    原行为，由 2.5ms tick 兜底）；`skynet_server.c` 的 `skynet_context_push` 在 `skynet_mq_push`
+    之后调用它。
+  - 收益面：所有跨线程 push 路径（sngo 池响应 / redis 订阅推送 / etcd watch / MQ 分片叫醒 /
+    SIGTERM 关机指令）。实测：L2 闭合环 conc=1 **385 → 2 521 qps（6.5×）**，conc=8 redis 类
+    1.3 万 → 2.1 万 qps、p99 2.6ms → 0.9ms。
 - 定制统一收敛在 `skynet-src/`，与扩展编排（3rd 目录）互不干扰
 
 ## 五、维护

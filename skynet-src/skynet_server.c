@@ -228,6 +228,11 @@ skynet_context_push(uint32_t handle, struct skynet_message *message) {
 		return -1;
 	}
 	skynet_mq_push(ctx->queue, message);
+	// 引擎扩展（simple-engine，2026-09-16 perf T5）：skynet_mq_push 只挂 global queue、
+	// 不唤醒 worker；worker 睡在 pthread_cond_wait 上且仅由 timer 每 2.5ms 的 wakeup() 叫醒
+	// ⇒ 空闲服务收到外部 push（sngo 池响应/订阅推送/etcd watch/MQ 叫醒）要等一个 tick。
+	// 这里 push 后立即 signal（无睡眠 worker 时是空操作，见 skynet_wakeup_worker 注释）。
+	skynet_wakeup_worker();
 	skynet_context_release(ctx);
 
 	return 0;

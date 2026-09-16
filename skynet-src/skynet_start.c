@@ -68,6 +68,35 @@ wakeup(struct monitor *m, int busy) {
 	}
 }
 
+// 引擎扩展（simple-engine，2026-09-16 perf T5）：外部线程投递消息后立即唤醒睡眠 worker。
+//
+// 问题：worker 无消息时睡在 pthread_cond_wait(&m->cond) 上；全仓只有两处 signal——
+// thread_timer 每 2.5ms 的 wakeup(m, m->count-1) 与 thread_socket 的 socket 事件。
+// 而 skynet_mq_push（跨线程 push 的唯一入口）**只把队列挂进 global queue、不 signal**
+// ⇒ 空闲服务收到外部 push 的消息要等下一个 2.5ms tick 才被取出。实测：sngo 池调用闭合环
+// 每调用固定 +2.5ms（conc=1/2 全部场景 p50=2.57ms；conc=8 时队列常非空、tick 被摊薄）。
+//
+// 实现要点（为什么这样写）：
+//   - 用 G_MONITOR（start() 里登记）而不是 S/全局单例：struct monitor 是本文件私有的；
+//   - 先读 m->sleep 再决定是否上锁：sleep==0 表示没有睡眠 worker（高负载常态）→ 直接返回，
+//     不引入消息热路径的额外锁开销；读到 0 但恰好有 worker 正在入睡时可能"丢失一次信号"，
+//     此时退化为原行为（下一个 2.5ms tick 兜底）——不引入新故障模式；
+//   - 真正 signal 时**持 m->mutex**：worker 是持锁 ++sleep 后 cond_wait 的，持锁 signal
+//     才能杜绝经典的 lost-wakeup（signal 落在"已判定无消息、尚未 cond_wait"的窗口里）；
+//   - 多次 signal 无害（spurious wakeup 由 dispatch 循环自然处理）。
+static struct monitor * G_MONITOR = NULL;
+
+void
+skynet_wakeup_worker(void) {
+	struct monitor * m = G_MONITOR;
+	if (m == NULL || m->sleep == 0) {
+		return;
+	}
+	pthread_mutex_lock(&m->mutex);
+	pthread_cond_signal(&m->cond);
+	pthread_mutex_unlock(&m->mutex);
+}
+
 static void *
 thread_socket(void *p) {
 	struct monitor * m = p;
@@ -241,6 +270,8 @@ start(int thread) {
 		fprintf(stderr, "Init cond error");
 		exit(1);
 	}
+
+	G_MONITOR = m;	// 引擎扩展（simple-engine，2026-09-16 perf T5）：登记给 skynet_wakeup_worker
 
 	create_thread(&pid[0], thread_monitor, m);
 	create_thread(&pid[1], thread_timer, m);
